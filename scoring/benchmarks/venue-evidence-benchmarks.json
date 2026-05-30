@@ -1,0 +1,136 @@
+[
+  {
+    "id": "adjacent-venue-gps-drift",
+    "description": "Dense street cluster where the selected venue pin is close but another venue is also inside the GPS envelope.",
+    "submission": {
+      "id": "SUB-BENCH-1",
+      "installId": "INSTALL-1",
+      "geolocationStart": { "lat": 40.72995, "lon": -74.00058, "accuracy": 20 },
+      "geolocationEnd": { "lat": 40.72995, "lon": -74.00058, "accuracy": 20 },
+      "selectedVenue": {
+        "name": "Minetta Tavern",
+        "address": "113 MacDougal St",
+        "latitude": 40.7299881,
+        "longitude": -74.0007016,
+        "placeProviderId": "google:minetta"
+      }
+    },
+    "venue": {
+      "id": "venue-minetta",
+      "name": "Minetta Tavern",
+      "address": "113 MacDougal St",
+      "latitude": 40.7299881,
+      "longitude": -74.0007016,
+      "placeProviderId": "google:minetta"
+    },
+    "candidateVenues": [
+      {
+        "id": "venue-minetta",
+        "name": "Minetta Tavern",
+        "address": "113 MacDougal St",
+        "latitude": 40.7299881,
+        "longitude": -74.0007016,
+        "placeProviderId": "google:minetta"
+      },
+      {
+        "id": "venue-ale-house",
+        "name": "MacDougal Street Ale House",
+        "address": "122 MacDougal St",
+        "latitude": 40.7299115,
+        "longitude": -74.0004329,
+        "placeProviderId": "google:ale-house"
+      }
+    ],
+    "visualContext": {
+      "summary": "The frames depict a dim tavern or bar with tables and televisions.",
+      "venueIdentitySignals": [],
+      "obstructionFlags": ["darkness"],
+      "frames": [{ "assetId": "frame-1" }]
+    },
+    "radioContext": {
+      "wifi": { "status": "captured", "ssid": "#THEALEHOUSE", "summary": "#THEALEHOUSE" },
+      "bluetooth": { "status": "captured", "deviceCount": 12 }
+    },
+    "sourceAssessment": { "sourceClass": "likely_pa_system", "confidence": 0.89 },
+    "audioIdentification": { "title": "Piano Man", "matchedTrackConfidence": 0.9 },
+    "captureIntegrity": { "mediaSha256": "abc", "signatureStatus": "unsigned_or_unverified", "clockSkewStatus": "clear" },
+    "audioDeconstruction": { "status": "failed" },
+    "rightsAndCaseContext": { "licenseAssessment": { "status": "unlicensed" } },
+    "history": {
+      "reports": [
+        { "id": "old-report-1", "venueId": "venue-minetta", "createdAt": "2026-05-20T00:00:00.000Z", "analystStatus": "confirmed" }
+      ],
+      "submissions": [],
+      "caseLedger": [],
+      "reviewLedger": []
+    },
+    "expected": {
+      "adjacentVenueAmbiguity": true,
+      "venueAttributionStatus": "adjacent_venue_ambiguous",
+      "legalReadinessStatus": "manual_review",
+      "venueIdentityMaxScore": 59
+    }
+  },
+  {
+    "id": "exact-venue-specific-visual",
+    "description": "Single venue inside GPS envelope with venue-specific visual identity and no nearby alternate.",
+    "submission": {
+      "id": "SUB-BENCH-2",
+      "installId": "INSTALL-2",
+      "geolocationStart": { "lat": 40.72999, "lon": -74.00070, "accuracy": 10 },
+      "geolocationEnd": { "lat": 40.72999, "lon": -74.00070, "accuracy": 10 },
+      "selectedVenue": {
+        "name": "Minetta Tavern",
+        "address": "113 MacDougal St",
+        "latitude": 40.7299881,
+        "longitude": -74.0007016,
+        "placeProviderId": "google:minetta"
+      }
+    },
+    "venue": {
+      "id": "venue-minetta",
+      "name": "Minetta Tavern",
+      "address": "113 MacDougal St",
+      "latitude": 40.7299881,
+      "longitude": -74.0007016,
+      "placeProviderId": "google:minetta"
+    },
+    "candidateVenues": [
+      {
+        "id": "venue-minetta",
+        "name": "Minetta Tavern",
+        "address": "113 MacDougal St",
+        "latitude": 40.7299881,
+        "longitude": -74.0007016,
+        "placeProviderId": "google:minetta"
+      }
+    ],
+    "visualContext": {
+      "summary": "Interior signage identifies Minetta Tavern.",
+      "venueIdentitySignals": ["Minetta Tavern signage visible"],
+      "obstructionFlags": [],
+      "frames": [{ "assetId": "frame-1" }]
+    },
+    "radioContext": {
+      "wifi": { "status": "captured", "ssid": "MINETTA-GUEST", "summary": "MINETTA-GUEST" },
+      "bluetooth": { "status": "captured", "deviceCount": 3 }
+    },
+    "sourceAssessment": { "sourceClass": "likely_pa_system", "confidence": 0.85 },
+    "audioIdentification": { "title": "Bad Moon Rising", "matchedTrackConfidence": 0.92 },
+    "captureIntegrity": { "mediaSha256": "abc", "signatureStatus": "signed_and_verified", "clockSkewStatus": "clear" },
+    "audioDeconstruction": { "status": "completed" },
+    "rightsAndCaseContext": { "licenseAssessment": { "status": "unlicensed" } },
+    "history": {
+      "reports": [],
+      "submissions": [],
+      "caseLedger": [],
+      "reviewLedger": []
+    },
+    "expected": {
+      "adjacentVenueAmbiguity": false,
+      "venueAttributionStatus": "target_venue_supported",
+      "legalReadinessStatus": "ready_for_legal",
+      "venueIdentityMinScore": 80
+    }
+  }
+]

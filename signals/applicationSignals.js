@@ -253,7 +253,7 @@ export const buildApplicationAssessmentContext = ({
 }) => {
     const start = submission?.geolocationStart || null;
     const end = submission?.geolocationEnd || null;
-    const locationDelta = buildLocationDelta({ submission, venue });
+    const locationDelta = buildLocationDelta({ submission, venue, candidateVenues: data?.venues || [] });
     const averageAccuracyMeters = locationDelta.averageAccuracyMeters;
     const geoDistanceMeters = locationDelta.minVenueDistanceMeters;
     const geoBucket = locationDelta.geoBucket;
@@ -412,6 +412,9 @@ export const sanitizeApplicationAssessment = (assessment, context, fallbackModel
             matchedVenueDistanceEndMeters: context.locationDelta.matchedVenueDistanceEndMeters,
             selectedVenueDistanceStartMeters: context.locationDelta.selectedVenueDistanceStartMeters,
             selectedVenueDistanceEndMeters: context.locationDelta.selectedVenueDistanceEndMeters,
+            adjacentVenueAmbiguity: context.locationDelta.adjacentVenueAmbiguity === true,
+            closestAlternateVenueCandidate: context.locationDelta.closestAlternateVenueCandidate || null,
+            closestAlternateDeltaMeters: context.locationDelta.closestAlternateDeltaMeters ?? null,
             selectedVenueMinDistanceMeters: context.venue.selectedVenueMinDistanceMeters,
             selectedVenueAvgDistanceMeters: context.venue.selectedVenueAvgDistanceMeters,
             selectedMatchedAligned: context.venue.selectedMatchedAligned,
@@ -464,6 +467,7 @@ export const buildFallbackApplicationAssessment = (context) => {
         ? (gpsTrack.totalPathMeters >= 80 || gpsTrack.maxDeviationMeters >= 60)
         : Number(context.locationDelta.capturePathDeltaMeters || 0) >= 80;
     const anchorMismatch = Number(context.locationDelta.venueAnchorDeltaMeters || 0) >= 120;
+    const adjacentVenueAmbiguity = context.locationDelta.adjacentVenueAmbiguity === true;
     const obstructionPenalty = Math.min(0.3, (context.visual.obstructionFlags.length || 0) * 0.08);
     const venueCueSupport = Math.min(0.28, context.visual.venueCueCount * 0.08);
     const venueContextMitigation = strongVenueContext ? 0.26 : 0;
@@ -516,6 +520,9 @@ export const buildFallbackApplicationAssessment = (context) => {
     if (anchorMismatch) {
         attributionConfidence -= 0.08;
     }
+    if (adjacentVenueAmbiguity) {
+        attributionConfidence -= 0.18;
+    }
     attributionConfidence -= obstructionPenalty;
     attributionConfidence = scoreZeroToOne(attributionConfidence, 0.15);
 
@@ -524,6 +531,7 @@ export const buildFallbackApplicationAssessment = (context) => {
         + (context.capture.geoBucket === 'outside' ? 0.12 : 0)
         + (context.locationDelta.withinAccuracyEnvelope === false ? 0.08 : 0)
         + (selectedVenueFar ? 0.16 : 0)
+        + (adjacentVenueAmbiguity ? 0.18 : 0)
         + (!selectedMatchedAligned && context.venue.selectedVenueName && context.venue.matchedVenueName ? 0.08 : 0),
         0.5
     );
@@ -552,6 +560,7 @@ export const buildFallbackApplicationAssessment = (context) => {
     const outletAmbiguityRisk = scoreZeroToOne(
         (propertyAmbiguityCue ? 0.32 : 0)
         + (anchorMismatch ? 0.22 : 0)
+        + (adjacentVenueAmbiguity ? 0.24 : 0)
         + (!selectedMatchedAligned && context.venue.selectedVenueName && context.venue.matchedVenueName ? 0.22 : 0)
         + (context.visual.venueCueCount === 0 ? 0.08 : 0)
         + (context.capture.geoBucket === 'inside' ? 0.04 : 0),
@@ -574,7 +583,7 @@ export const buildFallbackApplicationAssessment = (context) => {
         locationContext = 'private_hotel_room';
     } else if (homeCue && privateSpaceRisk >= 0.52) {
         locationContext = 'private_home';
-    } else if (outletAmbiguityRisk >= 0.58 && context.capture.geoBucket !== 'outside') {
+    } else if ((adjacentVenueAmbiguity || outletAmbiguityRisk >= 0.58) && context.capture.geoBucket !== 'outside') {
         locationContext = 'outlet_ambiguity';
     } else if (context.capture.geoBucket === 'inside' && attributionConfidence >= 0.6) {
         locationContext = 'inside_venue';
@@ -665,6 +674,13 @@ export const buildFallbackApplicationAssessment = (context) => {
     }
     if (context.locationDelta.withinAccuracyEnvelope === false) {
         evidenceGaps.push('Capture sits outside the current GPS accuracy envelope for the primary venue anchor.');
+    }
+    if (adjacentVenueAmbiguity) {
+        const alternateName = context.locationDelta.closestAlternateVenueCandidate?.name || 'another nearby venue';
+        reasons.push(`${alternateName} is also inside the GPS accuracy envelope; closest-pin attribution is ambiguous.`);
+        edgeCaseTags.push('gps_ambiguity');
+        edgeCaseTags.push('wrong_unit');
+        evidenceGaps.push('Require venue-specific visual or radio corroboration before treating the closest map pin as the source.');
     }
     if (selectedVenueFar) {
         evidenceGaps.push(`Capture is ${Math.round(selectedVenueDeltaMeters)} m from the snitch-selected venue coordinate, which weakens venue attribution.`);

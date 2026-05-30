@@ -61,8 +61,22 @@ import {
     buildFallbackApplicationAssessment,
     generateApplicationAssessment,
 } from './signals/applicationSignals.js';
+import {
+    buildHistoricalEvidenceContext,
+    scoreEvidenceStrength,
+    scoreLegalReadiness,
+    scoreVenueIdentity,
+} from './signals/evidenceScoring.js';
+import {
+    LICENSE_STATUSES,
+    buildLicenseResolution,
+    buildVenueResolutionModel,
+    evaluateCaseReadiness,
+    evaluateLitigationEligibility,
+    normalizeLicenseStatus,
+} from './signals/enforcementReadiness.js';
 import { buildPrototypeChainOfCustody, derivePrototypeQualityScore } from './signals/authoritySignals.js';
-import { inferVenueAttribution as inferSharedVenueAttribution } from './shared/venueAttribution.js';
+import { inferVenueAttribution as inferSharedVenueAttribution } from './signals/venueAttribution.js';
 
 const serverDir = path.dirname(fileURLToPath(import.meta.url));
 const frontendDistDir = path.resolve(serverDir, '..', 'dist');
@@ -3527,12 +3541,11 @@ const buildVenueHistorySummary = (data, report) => {
 
 const buildEvidencePackage = (req, data, { report, submission, venue, merchant, org, caseRecord, reviews, rawAsset, audioAsset }) => {
     const contributor = submission?.installId ? getContributorByInstall(data, submission.installId) : null;
-    const songIdentity = submission?.songIdentity || null;
     const sourceAnalysis = report.sourceAnalysis || submission?.sourceAnalysis || null;
     const sourceReview = report.sourceReview || null;
     const visualAnalysis = report.visualAnalysis || submission?.visualAnalysis || null;
     const radioEvidence = submission?.radioEvidence || null;
-    const locationDelta = buildLocationDelta({ submission, venue });
+    const locationDelta = buildLocationDelta({ submission, venue, candidateVenues: data.venues || [] });
     const applicationAssessment = report.applicationAssessment
         || submission?.applicationAssessment
         || buildFallbackApplicationAssessment(buildApplicationAssessmentContext({
@@ -3570,160 +3583,215 @@ const buildEvidencePackage = (req, data, { report, submission, venue, merchant, 
             })
             .filter(Boolean)
         : [];
+    const captureIntegrity = buildCaptureIntegritySignals({
+        req,
+        submission,
+        report,
+        rawAsset,
+        audioAsset,
+        buildAssetUrl,
+        signatureStatus: getPresentationSignatureStatus(submission),
+    });
+    const radioContext = {
+        collectionVersion: radioEvidence?.collectionVersion || null,
+        limitations: radioEvidence?.limitations || [],
+        wifi: wifiEvidence ? {
+            ...wifiEvidence,
+            summary: summarizeRadioEntry(wifiEvidence),
+        } : null,
+        bluetooth: bluetoothEvidence ? {
+            ...bluetoothEvidence,
+            summary: summarizeRadioEntry(bluetoothEvidence),
+        } : null,
+    };
+    const audioIdentification = buildAudioIdentificationSignals({ submission, report, formatMatchedSong });
+    const audioDeconstruction = submission?.audioDeconstruction ? {
+        status: submission.audioDeconstruction.status || 'unknown',
+        provider: submission.audioDeconstruction.provider || 'demucs',
+        model: submission.audioDeconstruction.model || null,
+        device: submission.audioDeconstruction.device || null,
+        jobId: submission.audioDeconstruction.jobId || null,
+        preferredStem: submission.audioDeconstruction.preferredStem || null,
+        peakSelectionStem: submission.audioDeconstruction.peakSelectionStem || null,
+        fingerprintStem: submission.audioDeconstruction.fingerprintStem || null,
+        usedForPeakSelection: Boolean(submission.audioDeconstruction.usedForPeakSelection),
+        usedForFingerprinting: Boolean(submission.audioDeconstruction.usedForFingerprinting),
+        summary: submission.audioDeconstruction.summary || '',
+        error: submission.audioDeconstruction.error || null,
+        artifacts: audioDeconstructionAssets.map(({ stem, asset }) => ({
+            stem,
+            assetId: asset.id,
+            mimeType: asset.mimeType,
+            sizeBytes: asset.sizeBytes,
+            url: buildAssetUrl(req, asset),
+        })),
+    } : null;
+    const sourceAssessment = sourceAnalysis ? {
+        ...sourceAnalysis,
+        requestedMode: submission?.sourceClassifierMode || sourceAnalysis.classifierMode || null,
+        analystNote: sourceAnalysis.explanation?.[0] || null,
+        reviewedSource: sourceReview ? {
+            reviewedClass: sourceReview.reviewedClass,
+            notes: sourceReview.notes || '',
+            reviewedAt: sourceReview.reviewedAt || null,
+            reviewerId: sourceReview.reviewerId || null,
+            isOverride: Boolean(sourceReview.isOverride),
+        } : null,
+    } : null;
+    const visualContext = visualAnalysis ? {
+        ...visualAnalysis,
+        peakWindows: visualAnalysis.peakWindows || [],
+        frames: keyFrameAssets.map((asset) => ({
+            assetId: asset.id,
+            timestampSeconds: asset.metadata?.timestampSeconds ?? null,
+            peakRank: asset.metadata?.peakRank ?? null,
+            relativeIntensity: asset.metadata?.relativeIntensity ?? null,
+            mimeType: asset.mimeType,
+            url: buildAssetUrl(req, asset),
+        })),
+    } : (keyFrameAssets.length ? {
+        peakWindows: [],
+        frames: keyFrameAssets.map((asset) => ({
+            assetId: asset.id,
+            timestampSeconds: asset.metadata?.timestampSeconds ?? null,
+            peakRank: asset.metadata?.peakRank ?? null,
+            relativeIntensity: asset.metadata?.relativeIntensity ?? null,
+            mimeType: asset.mimeType,
+            url: buildAssetUrl(req, asset),
+        })),
+    } : null);
+    const venueContext = {
+        selectedVenue: submission?.selectedVenue || null,
+        matchedVenue: venue ? {
+            id: venue.id,
+            name: venue.name,
+            address: venue.address,
+            city: venue.city || null,
+            latitude: venue.latitude ?? null,
+            longitude: venue.longitude ?? null,
+            placeProviderId: venue.placeProviderId || null,
+            placeProvider: venue.placeProvider || null,
+        } : null,
+        merchant: merchant ? {
+            id: merchant.id,
+            venueName: merchant.venueName,
+            legalEntityName: merchant.legalEntityName || null,
+            gstin: merchant.gstin || null,
+            cityTier: merchant.cityTier || null,
+            venueType: merchant.venueType || null,
+            outletCount: merchant.outletCount || null,
+            eventCapability: merchant.eventCapability || null,
+        } : null,
+        venueHistory: buildVenueHistorySummary(data, report),
+    };
+    const rightsAndCaseContext = {
+        org: org ? {
+            id: org.id,
+            name: org.name,
+            type: org.type,
+            slug: org.slug,
+        } : null,
+        rightsType: report.rightsType || null,
+        rightsOrg: report.rightsOrg || null,
+        licenseAssessment: report.licenseAssessment || null,
+        analystStatus: report.analystStatus || null,
+        estimatedRecoverableValueInr: report.estimatedRecoverableValueInr || 0,
+        rewardEligibility: Boolean(report.rewardEligibility),
+        rewardDisposition: report.rewardDisposition || null,
+        case: caseRecord ? {
+            id: caseRecord.id,
+            reference: caseRecord.reference,
+            caseStatus: caseRecord.caseStatus,
+            licenseStatus: caseRecord.licenseStatus,
+            evidenceCount: caseRecord.evidenceCount,
+            planningBand: caseRecord.planningBand,
+        } : null,
+    };
+    const reviewTrail = {
+        analystReviews: reviews.map((review) => ({
+            id: review.id,
+            reviewerId: review.reviewerId,
+            verdict: review.verdict,
+            tags: review.tags || [],
+            notes: review.notes || '',
+            reviewedAt: review.reviewedAt,
+        })),
+        sourceReviews: getSourceReviewsForReport(data, report.id).map((review) => ({
+            id: review.id,
+            reviewerId: review.reviewerId,
+            reviewedClass: review.reviewedClass,
+            notes: review.notes || '',
+            reviewedAt: review.reviewedAt,
+            predictedClass: review.predictedClass || null,
+            predictedConfidence: review.predictedConfidence ?? null,
+            predictedScore: review.predictedScore ?? null,
+            predictedModelVersion: review.predictedModelVersion || null,
+            isOverride: Boolean(review.isOverride),
+        })),
+    };
+    const historicalEvidence = buildHistoricalEvidenceContext({
+        data,
+        report,
+        submission,
+        venue,
+        caseRecord,
+        reviews,
+    });
+    const venueIdentityScore = scoreVenueIdentity({
+        locationDelta,
+        visualContext: visualContext || {},
+        radioContext,
+        venueContext,
+        historicalEvidence,
+    });
+    const evidenceStrengthScore = scoreEvidenceStrength({
+        captureIntegrity,
+        audioIdentification,
+        audioDeconstruction,
+        sourceAssessment,
+        visualContext: visualContext || {},
+        rightsAndCaseContext,
+        historicalEvidence,
+    });
+    const venueAttributionPreview = inferSharedVenueAttribution({
+        evidencePackage: {
+            locationDelta,
+            visualContext: visualContext || {},
+        },
+        matchedVenue: venueContext.matchedVenue,
+        selectedVenue: venueContext.selectedVenue,
+    });
+    const legalReadinessScore = scoreLegalReadiness({
+        venueIdentityScore,
+        evidenceStrengthScore,
+        venueAttribution: venueAttributionPreview,
+        applicationLayer: applicationAssessment,
+        historicalEvidence,
+    });
 
     return {
         packageVersion: 'evidence-package-v2',
-        captureIntegrity: buildCaptureIntegritySignals({
-            req,
-            submission,
-            report,
-            rawAsset,
-            audioAsset,
-            buildAssetUrl,
-            signatureStatus: getPresentationSignatureStatus(submission),
-        }),
-        radioContext: {
-            collectionVersion: radioEvidence?.collectionVersion || null,
-            limitations: radioEvidence?.limitations || [],
-            wifi: wifiEvidence ? {
-                ...wifiEvidence,
-                summary: summarizeRadioEntry(wifiEvidence),
-            } : null,
-            bluetooth: bluetoothEvidence ? {
-                ...bluetoothEvidence,
-                summary: summarizeRadioEntry(bluetoothEvidence),
-            } : null,
-        },
-        audioIdentification: buildAudioIdentificationSignals({ submission, report, formatMatchedSong }),
-        audioDeconstruction: submission?.audioDeconstruction ? {
-            status: submission.audioDeconstruction.status || 'unknown',
-            provider: submission.audioDeconstruction.provider || 'demucs',
-            model: submission.audioDeconstruction.model || null,
-            device: submission.audioDeconstruction.device || null,
-            jobId: submission.audioDeconstruction.jobId || null,
-            preferredStem: submission.audioDeconstruction.preferredStem || null,
-            peakSelectionStem: submission.audioDeconstruction.peakSelectionStem || null,
-            fingerprintStem: submission.audioDeconstruction.fingerprintStem || null,
-            usedForPeakSelection: Boolean(submission.audioDeconstruction.usedForPeakSelection),
-            usedForFingerprinting: Boolean(submission.audioDeconstruction.usedForFingerprinting),
-            summary: submission.audioDeconstruction.summary || '',
-            error: submission.audioDeconstruction.error || null,
-            artifacts: audioDeconstructionAssets.map(({ stem, asset }) => ({
-                stem,
-                assetId: asset.id,
-                mimeType: asset.mimeType,
-                sizeBytes: asset.sizeBytes,
-                url: buildAssetUrl(req, asset),
-            })),
-        } : null,
-        sourceAssessment: sourceAnalysis ? {
-            ...sourceAnalysis,
-            requestedMode: submission?.sourceClassifierMode || sourceAnalysis.classifierMode || null,
-            analystNote: sourceAnalysis.explanation?.[0] || null,
-            reviewedSource: sourceReview ? {
-                reviewedClass: sourceReview.reviewedClass,
-                notes: sourceReview.notes || '',
-                reviewedAt: sourceReview.reviewedAt || null,
-                reviewerId: sourceReview.reviewerId || null,
-                isOverride: Boolean(sourceReview.isOverride),
-            } : null,
-        } : null,
-        visualContext: visualAnalysis ? {
-            ...visualAnalysis,
-            peakWindows: visualAnalysis.peakWindows || [],
-            frames: keyFrameAssets.map((asset) => ({
-                assetId: asset.id,
-                timestampSeconds: asset.metadata?.timestampSeconds ?? null,
-                peakRank: asset.metadata?.peakRank ?? null,
-                relativeIntensity: asset.metadata?.relativeIntensity ?? null,
-                mimeType: asset.mimeType,
-                url: buildAssetUrl(req, asset),
-            })),
-        } : (keyFrameAssets.length ? {
-            peakWindows: [],
-            frames: keyFrameAssets.map((asset) => ({
-                assetId: asset.id,
-                timestampSeconds: asset.metadata?.timestampSeconds ?? null,
-                peakRank: asset.metadata?.peakRank ?? null,
-                relativeIntensity: asset.metadata?.relativeIntensity ?? null,
-                mimeType: asset.mimeType,
-                url: buildAssetUrl(req, asset),
-            })),
-        } : null),
+        captureIntegrity,
+        radioContext,
+        audioIdentification,
+        audioDeconstruction,
+        sourceAssessment,
+        visualContext,
         locationDelta,
+        historicalEvidence,
+        scoring: {
+            modelVersion: 'venue-evidence-scoring-v1',
+            venueIdentityScore,
+            evidenceStrengthScore,
+            legalReadinessScore,
+        },
         applicationLayer: applicationAssessment ? {
             ...applicationAssessment,
         } : null,
-        venueContext: {
-            selectedVenue: submission?.selectedVenue || null,
-            matchedVenue: venue ? {
-                id: venue.id,
-                name: venue.name,
-                address: venue.address,
-                city: venue.city || null,
-                latitude: venue.latitude ?? null,
-                longitude: venue.longitude ?? null,
-                placeProviderId: venue.placeProviderId || null,
-                placeProvider: venue.placeProvider || null,
-            } : null,
-            merchant: merchant ? {
-                id: merchant.id,
-                venueName: merchant.venueName,
-                legalEntityName: merchant.legalEntityName || null,
-                gstin: merchant.gstin || null,
-                cityTier: merchant.cityTier || null,
-                venueType: merchant.venueType || null,
-                outletCount: merchant.outletCount || null,
-                eventCapability: merchant.eventCapability || null,
-            } : null,
-            venueHistory: buildVenueHistorySummary(data, report),
-        },
-        rightsAndCaseContext: {
-            org: org ? {
-                id: org.id,
-                name: org.name,
-                type: org.type,
-                slug: org.slug,
-            } : null,
-            rightsType: report.rightsType || null,
-            rightsOrg: report.rightsOrg || null,
-            licenseAssessment: report.licenseAssessment || null,
-            analystStatus: report.analystStatus || null,
-            estimatedRecoverableValueInr: report.estimatedRecoverableValueInr || 0,
-            rewardEligibility: Boolean(report.rewardEligibility),
-            rewardDisposition: report.rewardDisposition || null,
-            case: caseRecord ? {
-                id: caseRecord.id,
-                reference: caseRecord.reference,
-                caseStatus: caseRecord.caseStatus,
-                licenseStatus: caseRecord.licenseStatus,
-                evidenceCount: caseRecord.evidenceCount,
-                planningBand: caseRecord.planningBand,
-            } : null,
-        },
+        venueContext,
+        rightsAndCaseContext,
         contributorContext: buildContributorPublicView(contributor, data),
-        reviewTrail: {
-            analystReviews: reviews.map((review) => ({
-                id: review.id,
-                reviewerId: review.reviewerId,
-                verdict: review.verdict,
-                tags: review.tags || [],
-                notes: review.notes || '',
-                reviewedAt: review.reviewedAt,
-            })),
-            sourceReviews: getSourceReviewsForReport(data, report.id).map((review) => ({
-                id: review.id,
-                reviewerId: review.reviewerId,
-                reviewedClass: review.reviewedClass,
-                notes: review.notes || '',
-                reviewedAt: review.reviewedAt,
-                predictedClass: review.predictedClass || null,
-                predictedConfidence: review.predictedConfidence ?? null,
-                predictedScore: review.predictedScore ?? null,
-                predictedModelVersion: review.predictedModelVersion || null,
-                isOverride: Boolean(review.isOverride),
-            })),
-        },
+        reviewTrail,
     };
 };
 
@@ -3886,6 +3954,43 @@ const getPrototypeAuditTrailForCase = ({ caseRecord, primaryReport, stage }) => 
     return buildPrototypeDefaultAuditTrail({ caseRecord, primaryReport, stage });
 };
 
+const ensurePrototypeAuditTrail = ({ caseRecord, primaryReport }) => {
+    const stage = derivePrototypeStageFromCase({ caseRecord, primaryReport });
+    if (!Array.isArray(caseRecord.authorityAuditTrail) || !caseRecord.authorityAuditTrail.length) {
+        caseRecord.authorityAuditTrail = buildPrototypeDefaultAuditTrail({ caseRecord, primaryReport, stage });
+    }
+    return stage;
+};
+
+const appendEnforcementAuditEvent = ({ caseRecord, primaryReport, eventType, actorId = 'Admin', previousValue = null, newValue = null, source = 'authority', notes = '', captureId = null }) => {
+    ensurePrototypeAuditTrail({ caseRecord, primaryReport });
+    const occurredAt = new Date().toISOString();
+    const entry = {
+        id: crypto.randomUUID(),
+        event_type: eventType,
+        action: eventType,
+        actor: actorId,
+        actor_id: actorId,
+        occurred_at: occurredAt,
+        timestamp: occurredAt,
+        case_id: caseRecord.id,
+        capture_id: captureId || caseRecord.primarySubmissionId || null,
+        previous_value: previousValue,
+        new_value: newValue,
+        source,
+        notes,
+        details: notes || eventType,
+    };
+    caseRecord.authorityAuditTrail.push(entry);
+    caseRecord.updatedAt = occurredAt;
+    return entry;
+};
+
+const getPrototypeCaseViewByIdentifier = (req, data, identifier) => {
+    const caseRecord = getPrototypeCaseRecordByIdentifier(data, identifier);
+    return caseRecord ? buildPrototypeCaseView(req, data, caseRecord) : null;
+};
+
 const buildPrototypeCaseView = (req, data, caseRecord) => {
     const primaryReport = getPrimaryReportForCaseRecord(data, caseRecord);
     if (!primaryReport) {
@@ -3955,7 +4060,8 @@ const buildPrototypeCaseView = (req, data, caseRecord) => {
         || (stage === 'Ready For Legal' ? 'Lawyer' : null)
         || undefined;
 
-    return {
+    const licenseResolution = buildLicenseResolution({ caseRecord, report: primaryReport });
+    const prototypeCase = {
         id: caseRecord.reference,
         isNew: stage === 'New',
         timestamp: reportView?.createdAt || caseRecord?.createdAt || new Date().toISOString(),
@@ -3997,6 +4103,8 @@ const buildPrototypeCaseView = (req, data, caseRecord) => {
         locationDelta: evidencePackage?.locationDelta || null,
         radioContext,
         venueAttribution,
+        scoring: evidencePackage?.scoring || null,
+        historicalEvidence: evidencePackage?.historicalEvidence || null,
         venueContext: {
             selectedVenue,
             matchedVenue,
@@ -4030,6 +4138,22 @@ const buildPrototypeCaseView = (req, data, caseRecord) => {
         comments: [],
         unreadComments: false,
         unreadMajorChanges: stage === 'New',
+    };
+    const venueResolution = buildVenueResolutionModel(prototypeCase);
+    const readiness = evaluateCaseReadiness({ caseView: prototypeCase, licenseResolution });
+
+    return {
+        ...prototypeCase,
+        licenseResolution,
+        venueResolution,
+        readiness,
+        readiness_score: readiness.readiness_score,
+        readiness_band: readiness.readiness_band,
+        readiness_reasons: readiness.readiness_reasons,
+        next_actions: readiness.next_actions,
+        prosecution_strength_score: readiness.prosecution_strength_score,
+        prosecution_strength_label: readiness.prosecution_strength_label,
+        prosecution_strength_reasons: readiness.prosecution_strength_reasons,
     };
 };
 
@@ -5558,6 +5682,459 @@ app.get('/api/authority-prototype/cases', async (req, res) => {
         cases,
         generatedAt: new Date().toISOString(),
     });
+});
+
+app.get('/api/authority-prototype/cases/:id/readiness', async (req, res) => {
+    const data = await readPlatformData();
+    const caseView = getPrototypeCaseViewByIdentifier(req, data, req.params.id);
+    if (!caseView) {
+        return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json({
+        case_id: caseView.id,
+        readiness_score: caseView.readiness_score,
+        readiness_band: caseView.readiness_band,
+        readiness_label: caseView.readiness?.readiness_label,
+        readiness_reasons: caseView.readiness_reasons,
+        next_actions: caseView.next_actions,
+        prosecution_strength_score: caseView.prosecution_strength_score,
+        prosecution_strength_label: caseView.prosecution_strength_label,
+        prosecution_strength_reasons: caseView.prosecution_strength_reasons,
+        gates: caseView.readiness?.gates || null,
+    });
+});
+
+app.get('/api/cases/:id/readiness', async (req, res) => {
+    const data = await readPlatformData();
+    const caseView = getPrototypeCaseViewByIdentifier(req, data, req.params.id);
+    if (!caseView) return res.status(404).json({ error: 'Case not found' });
+    res.json(caseView.readiness);
+});
+
+app.get('/api/authority-prototype/cases/:id/litigation-eligibility', async (req, res) => {
+    const data = await readPlatformData();
+    const caseView = getPrototypeCaseViewByIdentifier(req, data, req.params.id);
+    if (!caseView) {
+        return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(evaluateLitigationEligibility({ caseView, licenseResolution: caseView.licenseResolution }));
+});
+
+app.get('/api/cases/:id/litigation-eligibility', async (req, res) => {
+    const data = await readPlatformData();
+    const caseView = getPrototypeCaseViewByIdentifier(req, data, req.params.id);
+    if (!caseView) return res.status(404).json({ error: 'Case not found' });
+    res.json(evaluateLitigationEligibility({ caseView, licenseResolution: caseView.licenseResolution }));
+});
+
+app.post('/api/authority-prototype/cases/:id/litigation-submit', async (req, res) => {
+    const actorId = String(req.body?.actorId || req.body?.actorRole || 'Admin').trim() || 'Admin';
+    const data = await readPlatformData();
+    const caseView = getPrototypeCaseViewByIdentifier(req, data, req.params.id);
+    if (!caseView) {
+        return res.status(404).json({ error: 'Case not found' });
+    }
+    const eligibility = evaluateLitigationEligibility({ caseView, licenseResolution: caseView.licenseResolution });
+    if (!eligibility.can_send_to_litigation) {
+        return res.status(409).json({
+            error: 'Case is blocked from litigation submission',
+            ...eligibility,
+        });
+    }
+
+    await mutatePlatformData((draft) => {
+        const caseRecord = getPrototypeCaseRecordByIdentifier(draft, req.params.id);
+        const primaryReport = getPrimaryReportForCaseRecord(draft, caseRecord);
+        if (!caseRecord || !primaryReport) throw new Error('Case not found');
+        caseRecord.litigationSubmittedAt = new Date().toISOString();
+        caseRecord.litigationSubmittedBy = actorId;
+        appendEnforcementAuditEvent({
+            caseRecord,
+            primaryReport,
+            eventType: 'Litigation Submission',
+            actorId,
+            previousValue: null,
+            newValue: { litigationSubmittedAt: caseRecord.litigationSubmittedAt },
+            source: 'litigation-submit',
+            notes: 'Case submitted to litigation after server-side eligibility check.',
+        });
+    });
+
+    const updatedData = await readPlatformData();
+    res.json({
+        ok: true,
+        eligibility,
+        case: getPrototypeCaseViewByIdentifier(req, updatedData, req.params.id),
+    });
+});
+
+app.post('/api/cases/:id/litigation-submit', async (req, res) => {
+    req.url = `/api/authority-prototype/cases/${req.params.id}/litigation-submit`;
+    app._router.handle(req, res);
+});
+
+app.get('/api/authority-prototype/cases/:id/license-resolution', async (req, res) => {
+    const data = await readPlatformData();
+    const caseRecord = getPrototypeCaseRecordByIdentifier(data, req.params.id);
+    const primaryReport = getPrimaryReportForCaseRecord(data, caseRecord);
+    if (!caseRecord || !primaryReport) {
+        return res.status(404).json({ error: 'Case not found' });
+    }
+    res.json(buildLicenseResolution({ caseRecord, report: primaryReport }));
+});
+
+app.get('/api/cases/:id/license-resolution', async (req, res) => {
+    const data = await readPlatformData();
+    const caseRecord = getPrototypeCaseRecordByIdentifier(data, req.params.id);
+    const primaryReport = getPrimaryReportForCaseRecord(data, caseRecord);
+    if (!caseRecord || !primaryReport) return res.status(404).json({ error: 'Case not found' });
+    res.json(buildLicenseResolution({ caseRecord, report: primaryReport }));
+});
+
+app.post('/api/authority-prototype/cases/:id/license-resolution', async (req, res) => {
+    const nextStatus = normalizeLicenseStatus(req.body?.license_status || req.body?.licenseStatus);
+    const actorId = String(req.body?.actorId || req.body?.actorRole || 'Admin').trim() || 'Admin';
+    const source = String(req.body?.source || req.body?.license_source || '').trim();
+    const notes = String(req.body?.notes || '').trim();
+    const registryLookupId = req.body?.registry_lookup_id || req.body?.registryLookupId || null;
+    const registrySnapshot = req.body?.registry_response_snapshot || req.body?.registryResponseSnapshot || null;
+
+    if (!Object.values(LICENSE_STATUSES).includes(nextStatus)) {
+        return res.status(400).json({ error: 'Invalid license status' });
+    }
+    if (!source) {
+        return res.status(400).json({ error: 'License resolution source is required' });
+    }
+    if ([LICENSE_STATUSES.LICENSED, LICENSE_STATUSES.UNLICENSED].includes(nextStatus) && !notes) {
+        return res.status(400).json({ error: 'Manual attestation notes are required for resolved license statuses' });
+    }
+
+    const result = await mutatePlatformData((draft) => {
+        const caseRecord = getPrototypeCaseRecordByIdentifier(draft, req.params.id);
+        const primaryReport = getPrimaryReportForCaseRecord(draft, caseRecord);
+        if (!caseRecord || !primaryReport) throw new Error('Case not found');
+        const previousValue = buildLicenseResolution({ caseRecord, report: primaryReport });
+        const checkedAt = new Date().toISOString();
+        caseRecord.licenseResolution = {
+            license_status: nextStatus,
+            license_source: source,
+            license_checked_at: checkedAt,
+            license_checked_by: actorId,
+            manual_attestation: {
+                actor_id: actorId,
+                occurred_at: checkedAt,
+                source,
+                notes,
+            },
+            registry_lookup_id: registryLookupId,
+            registry_response_snapshot: registrySnapshot,
+        };
+        caseRecord.licenseStatus = nextStatus.toLowerCase();
+        caseRecord.licenseSource = source;
+        appendEnforcementAuditEvent({
+            caseRecord,
+            primaryReport,
+            eventType: 'Rights Status Changed',
+            actorId,
+            previousValue,
+            newValue: caseRecord.licenseResolution,
+            source,
+            notes,
+        });
+        return caseRecord;
+    }).catch((error) => ({ error }));
+
+    if (result.error) {
+        return res.status(400).json({ error: result.error.message });
+    }
+
+    const data = await readPlatformData();
+    res.json({
+        ok: true,
+        licenseResolution: buildLicenseResolution({
+            caseRecord: getPrototypeCaseRecordByIdentifier(data, req.params.id),
+            report: getPrimaryReportForCaseRecord(data, getPrototypeCaseRecordByIdentifier(data, req.params.id)),
+        }),
+        case: getPrototypeCaseViewByIdentifier(req, data, req.params.id),
+    });
+});
+
+app.post('/api/cases/:id/license-resolution', async (req, res) => {
+    req.url = `/api/authority-prototype/cases/${req.params.id}/license-resolution`;
+    app._router.handle(req, res);
+});
+
+const buildVenueCaptureRows = (req, data, venueId) => data.reports
+    .filter((report) => report.venueId === venueId)
+    .map((report) => {
+        const submission = data.submissions.find((entry) => entry.id === report.submissionId) || null;
+        const caseRecord = report.caseId ? data.caseLedger.find((entry) => entry.id === report.caseId) || null : null;
+        const rawAsset = submission?.rawVideoAssetId ? data.assets.find((entry) => entry.id === submission.rawVideoAssetId) || null : null;
+        return {
+            capture_id: submission?.id || null,
+            submission_reference: submission?.reference || null,
+            report_id: report.id,
+            report_reference: report.reference || null,
+            case_id: caseRecord?.reference || caseRecord?.id || null,
+            captured_at: report.createdAt || submission?.createdAt || null,
+            status: report.analystStatus || report.status || 'unresolved',
+            confirmed: ['confirmed', 'verified', 'actionable'].includes(String(report.analystStatus || '').toLowerCase()),
+            song: report.title || submission?.songIdentity?.title || null,
+            artist: report.artist || submission?.songIdentity?.artist || null,
+            video_url: rawAsset ? buildAssetUrl(req, rawAsset) : null,
+        };
+    })
+    .sort((left, right) => new Date(left.captured_at) - new Date(right.captured_at));
+
+const buildRepeatCaptureSummary = (captures) => {
+    const confirmed = captures.filter((capture) => capture.confirmed);
+    const dated = confirmed.map((capture) => capture.captured_at).filter(Boolean).sort();
+    return {
+        confirmed_incident_count: confirmed.length,
+        unresolved_capture_count: captures.length - confirmed.length,
+        distinct_capture_dates: new Set(confirmed.map((capture) => String(capture.captured_at || '').slice(0, 10)).filter(Boolean)).size,
+        distinct_detected_songs: new Set(confirmed.map((capture) => capture.song).filter(Boolean)).size,
+        first_detected_at: dated[0] || null,
+        latest_detected_at: dated[dated.length - 1] || null,
+    };
+};
+
+app.get('/api/authority-prototype/venues/:venueId/captures', async (req, res) => {
+    const data = await readPlatformData();
+    const captures = buildVenueCaptureRows(req, data, req.params.venueId);
+    res.json({ venue_id: req.params.venueId, captures });
+});
+
+app.get('/api/venues/:venueId/captures', async (req, res) => {
+    const data = await readPlatformData();
+    const captures = buildVenueCaptureRows(req, data, req.params.venueId);
+    res.json({ venue_id: req.params.venueId, captures });
+});
+
+app.get('/api/authority-prototype/venues/:venueId/incident-timeline', async (req, res) => {
+    const data = await readPlatformData();
+    const captures = buildVenueCaptureRows(req, data, req.params.venueId);
+    res.json({
+        venue_id: req.params.venueId,
+        timeline: captures.map((capture) => ({
+            occurred_at: capture.captured_at,
+            event_type: capture.confirmed ? 'CONFIRMED_CAPTURE' : 'UNRESOLVED_CAPTURE',
+            capture,
+        })),
+    });
+});
+
+app.get('/api/venues/:venueId/incident-timeline', async (req, res) => {
+    const data = await readPlatformData();
+    const captures = buildVenueCaptureRows(req, data, req.params.venueId);
+    res.json({
+        venue_id: req.params.venueId,
+        timeline: captures.map((capture) => ({
+            occurred_at: capture.captured_at,
+            event_type: capture.confirmed ? 'CONFIRMED_CAPTURE' : 'UNRESOLVED_CAPTURE',
+            capture,
+        })),
+    });
+});
+
+app.get('/api/authority-prototype/venues/:venueId/repeat-capture-summary', async (req, res) => {
+    const data = await readPlatformData();
+    const captures = buildVenueCaptureRows(req, data, req.params.venueId);
+    res.json({
+        venue_id: req.params.venueId,
+        ...buildRepeatCaptureSummary(captures),
+    });
+});
+
+app.get('/api/venues/:venueId/repeat-capture-summary', async (req, res) => {
+    const data = await readPlatformData();
+    const captures = buildVenueCaptureRows(req, data, req.params.venueId);
+    res.json({
+        venue_id: req.params.venueId,
+        ...buildRepeatCaptureSummary(captures),
+    });
+});
+
+app.get('/api/authority-prototype/venue-resolution-queue', async (req, res) => {
+    const data = await readPlatformData();
+    const statusFilter = String(req.query.status || '').trim().toUpperCase();
+    const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number.parseInt(String(req.query.page_size || req.query.pageSize || '25'), 10) || 25));
+    const unresolved = data.caseLedger
+        .map((caseRecord) => buildPrototypeCaseView(req, data, caseRecord))
+        .filter(Boolean)
+        .filter((caseView) => caseView.venueResolution?.venue_status !== 'RESOLVED')
+        .filter((caseView) => !statusFilter || caseView.venueResolution?.resolution_status === statusFilter || caseView.venueResolution?.venue_status === statusFilter);
+    const start = (page - 1) * pageSize;
+    res.json({
+        page,
+        page_size: pageSize,
+        total: unresolved.length,
+        items: unresolved.slice(start, start + pageSize).map((caseView) => ({
+            case_id: caseView.id,
+            capture_id: caseView.venueAttribution?.capture_id || null,
+            location: caseView.location,
+            venueResolution: caseView.venueResolution,
+            readiness_band: caseView.readiness_band,
+            next_actions: caseView.next_actions,
+        })),
+    });
+});
+
+app.get('/api/venue-resolution-queue', async (req, res) => {
+    const data = await readPlatformData();
+    const statusFilter = String(req.query.status || '').trim().toUpperCase();
+    const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number.parseInt(String(req.query.page_size || req.query.pageSize || '25'), 10) || 25));
+    const unresolved = data.caseLedger
+        .map((caseRecord) => buildPrototypeCaseView(req, data, caseRecord))
+        .filter(Boolean)
+        .filter((caseView) => caseView.venueResolution?.venue_status !== 'RESOLVED')
+        .filter((caseView) => !statusFilter || caseView.venueResolution?.resolution_status === statusFilter || caseView.venueResolution?.venue_status === statusFilter);
+    const start = (page - 1) * pageSize;
+    res.json({
+        page,
+        page_size: pageSize,
+        total: unresolved.length,
+        items: unresolved.slice(start, start + pageSize),
+    });
+});
+
+const mutateCaptureVenueResolution = async ({ req, action, handler }) => mutatePlatformData((draft) => {
+    const captureId = req.params.captureId;
+    const submission = draft.submissions.find((entry) => entry.id === captureId || entry.reference === captureId);
+    if (!submission) throw new Error('Capture not found');
+    const report = draft.reports.find((entry) => entry.submissionId === submission.id) || null;
+    const caseRecord = report?.caseId ? draft.caseLedger.find((entry) => entry.id === report.caseId) || null : null;
+    const primaryReport = caseRecord ? getPrimaryReportForCaseRecord(draft, caseRecord) : report;
+    const actorId = String(req.body?.actorId || req.body?.actorRole || 'Admin').trim() || 'Admin';
+    const previousValue = submission.venueResolution || null;
+    const nextValue = handler({ draft, submission, report, caseRecord, actorId });
+    submission.venueResolution = {
+        ...(submission.venueResolution || {}),
+        ...nextValue,
+        updated_at: new Date().toISOString(),
+        updated_by: actorId,
+    };
+    if (caseRecord && primaryReport) {
+        appendEnforcementAuditEvent({
+            caseRecord,
+            primaryReport,
+            eventType: 'Venue Resolution',
+            actorId,
+            previousValue,
+            newValue: submission.venueResolution,
+            source: action,
+            notes: String(req.body?.notes || req.body?.note || action).trim(),
+            captureId: submission.id,
+        });
+    }
+    return submission.venueResolution;
+});
+
+app.post('/api/authority-prototype/captures/:captureId/venue-resolution/assign', async (req, res) => {
+    const result = await mutateCaptureVenueResolution({
+        req,
+        action: 'venue-resolution-assign',
+        handler: ({ actorId }) => ({
+            resolution_status: 'ASSIGNED',
+            assigned_to: req.body?.assignedTo || actorId,
+            resolution_notes: req.body?.notes || null,
+        }),
+    }).catch((error) => ({ error }));
+    if (result.error) return res.status(400).json({ error: result.error.message });
+    res.json({ ok: true, venueResolution: result });
+});
+
+app.post('/api/captures/:captureId/venue-resolution/assign', async (req, res) => {
+    req.url = `/api/authority-prototype/captures/${req.params.captureId}/venue-resolution/assign`;
+    app._router.handle(req, res);
+});
+
+app.post('/api/authority-prototype/captures/:captureId/venue-resolution/confirm', async (req, res) => {
+    const result = await mutateCaptureVenueResolution({
+        req,
+        action: 'venue-resolution-confirm',
+        handler: ({ draft, submission, report }) => {
+            const venueId = req.body?.venueId || req.body?.venue_id || null;
+            const venue = draft.venues.find((entry) => entry.id === venueId || entry.placeProviderId === venueId) || null;
+            if (!venue) throw new Error('Confirmed venue not found');
+            submission.selectedVenue = {
+                name: venue.name,
+                address: venue.address,
+                city: venue.city,
+                latitude: venue.latitude,
+                longitude: venue.longitude,
+                placeProviderId: venue.placeProviderId,
+                provider: venue.placeProvider,
+            };
+            submission.matchedVenue = venue.name;
+            if (report) report.venueId = venue.id;
+            return {
+                venue_status: 'RESOLVED',
+                resolution_status: 'RESOLVED',
+                confirmed_venue_id: venue.id,
+                resolution_notes: req.body?.notes || null,
+            };
+        },
+    }).catch((error) => ({ error }));
+    if (result.error) return res.status(400).json({ error: result.error.message });
+    res.json({ ok: true, venueResolution: result });
+});
+
+app.post('/api/captures/:captureId/venue-resolution/confirm', async (req, res) => {
+    req.url = `/api/authority-prototype/captures/${req.params.captureId}/venue-resolution/confirm`;
+    app._router.handle(req, res);
+});
+
+app.post('/api/authority-prototype/captures/:captureId/venue-resolution/reject-candidate', async (req, res) => {
+    const result = await mutateCaptureVenueResolution({
+        req,
+        action: 'venue-resolution-reject-candidate',
+        handler: ({ submission }) => ({
+            resolution_status: 'READY_FOR_REVIEW',
+            rejected_candidates: [
+                ...(submission.venueResolution?.rejected_candidates || []),
+                {
+                    venue_id: req.body?.venueId || req.body?.venue_id || null,
+                    reason: req.body?.reason || req.body?.notes || null,
+                    rejected_at: new Date().toISOString(),
+                },
+            ],
+        }),
+    }).catch((error) => ({ error }));
+    if (result.error) return res.status(400).json({ error: result.error.message });
+    res.json({ ok: true, venueResolution: result });
+});
+
+app.post('/api/captures/:captureId/venue-resolution/reject-candidate', async (req, res) => {
+    req.url = `/api/authority-prototype/captures/${req.params.captureId}/venue-resolution/reject-candidate`;
+    app._router.handle(req, res);
+});
+
+app.post('/api/authority-prototype/captures/:captureId/venue-resolution/field-note', async (req, res) => {
+    const result = await mutateCaptureVenueResolution({
+        req,
+        action: 'venue-resolution-field-note',
+        handler: ({ submission, actorId }) => ({
+            resolution_status: req.body?.resolutionStatus || submission.venueResolution?.resolution_status || 'NEEDS_FIELD_FOLLOW_UP',
+            field_notes: [
+                ...(submission.venueResolution?.field_notes || []),
+                {
+                    actor_id: actorId,
+                    occurred_at: new Date().toISOString(),
+                    note: req.body?.note || req.body?.notes || '',
+                },
+            ],
+        }),
+    }).catch((error) => ({ error }));
+    if (result.error) return res.status(400).json({ error: result.error.message });
+    res.json({ ok: true, venueResolution: result });
+});
+
+app.post('/api/captures/:captureId/venue-resolution/field-note', async (req, res) => {
+    req.url = `/api/authority-prototype/captures/${req.params.captureId}/venue-resolution/field-note`;
+    app._router.handle(req, res);
 });
 
 app.post('/api/authority-prototype/cases/:id/stage', async (req, res) => {

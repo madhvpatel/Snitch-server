@@ -159,7 +159,56 @@ const summarizeVenueDistances = ({ startPoint, endPoint, venuePoint }) => {
     };
 };
 
-export const buildLocationDelta = ({ submission, venue }) => {
+const getVenueIdentityKey = (venue) => {
+    if (!venue) {
+        return null;
+    }
+
+    return venue.placeProviderId
+        || venue.id
+        || `${cleanString(venue.name)}:${cleanString(venue.address || '')}`;
+};
+
+const buildNearbyVenueCandidates = ({ startPoint, endPoint, candidateVenues = [], selectedVenue, matchedVenue, accuracyEnvelopeMeters }) => {
+    if (!Array.isArray(candidateVenues) || !candidateVenues.length || !Number.isFinite(accuracyEnvelopeMeters)) {
+        return [];
+    }
+
+    const selectedKey = getVenueIdentityKey(selectedVenue);
+    const matchedKey = getVenueIdentityKey(matchedVenue);
+
+    return candidateVenues
+        .map((candidate) => {
+            const venuePoint = toLatLonPoint(candidate);
+            if (!venuePoint) {
+                return null;
+            }
+
+            const distances = summarizeVenueDistances({ startPoint, endPoint, venuePoint });
+            if (!Number.isFinite(distances.minDistanceMeters)) {
+                return null;
+            }
+
+            const identityKey = getVenueIdentityKey(candidate);
+            return {
+                id: candidate.id || null,
+                name: candidate.name || 'Unnamed venue',
+                address: candidate.address || null,
+                city: candidate.city || null,
+                placeProviderId: candidate.placeProviderId || null,
+                distanceMeters: distances.minDistanceMeters,
+                insideAccuracyEnvelope: distances.minDistanceMeters <= accuracyEnvelopeMeters,
+                isSelectedVenue: Boolean(identityKey && selectedKey && identityKey === selectedKey),
+                isMatchedVenue: Boolean(identityKey && matchedKey && identityKey === matchedKey),
+            };
+        })
+        .filter(Boolean)
+        .filter((candidate) => candidate.insideAccuracyEnvelope)
+        .sort((left, right) => left.distanceMeters - right.distanceMeters)
+        .slice(0, 8);
+};
+
+export const buildLocationDelta = ({ submission, venue, candidateVenues = [] }) => {
     const startPoint = toLatLonPoint(submission?.geolocationStart);
     const endPoint = toLatLonPoint(submission?.geolocationEnd);
     const selectedVenuePoint = toLatLonPoint(submission?.selectedVenue);
@@ -180,6 +229,26 @@ export const buildLocationDelta = ({ submission, venue }) => {
     const accuracyEnvelopeMeters = Number.isFinite(averageAccuracyMeters)
         ? Math.max(25, Math.round(averageAccuracyMeters * 1.25))
         : null;
+    const nearbyVenueCandidates = buildNearbyVenueCandidates({
+        startPoint,
+        endPoint,
+        candidateVenues,
+        selectedVenue: submission?.selectedVenue || null,
+        matchedVenue: venue || null,
+        accuracyEnvelopeMeters,
+    });
+    const primaryVenueKey = getVenueIdentityKey(venue) || getVenueIdentityKey(submission?.selectedVenue);
+    const alternateNearbyVenueCandidates = nearbyVenueCandidates.filter((candidate) => {
+        const candidateKey = candidate.placeProviderId || candidate.id || `${cleanString(candidate.name)}:${cleanString(candidate.address || '')}`;
+        return !primaryVenueKey || candidateKey !== primaryVenueKey;
+    });
+    const closestAlternateVenueCandidate = alternateNearbyVenueCandidates[0] || null;
+    const closestAlternateDeltaMeters = Number.isFinite(primaryDistanceMeters) && closestAlternateVenueCandidate
+        ? Math.abs(closestAlternateVenueCandidate.distanceMeters - primaryDistanceMeters)
+        : null;
+    const gpsAmbiguityThresholdMeters = Number.isFinite(averageAccuracyMeters)
+        ? Math.max(10, Math.round(averageAccuracyMeters * 0.5))
+        : 10;
 
     return {
         selectedVenueDistanceStartMeters: selectedVenue.startDistanceMeters,
@@ -216,5 +285,14 @@ export const buildLocationDelta = ({ submission, venue }) => {
         }),
         selectedMatchedAligned: namesLikelyMatch(submission?.selectedVenue?.name, venue?.name || submission?.matchedVenue || null),
         primaryVenueSource,
+        nearbyVenueCandidates,
+        closestAlternateVenueCandidate,
+        adjacentVenueAmbiguity: Boolean(
+            closestAlternateVenueCandidate
+            && Number.isFinite(closestAlternateDeltaMeters)
+            && closestAlternateDeltaMeters <= gpsAmbiguityThresholdMeters
+        ),
+        closestAlternateDeltaMeters,
+        gpsAmbiguityThresholdMeters,
     };
 };
