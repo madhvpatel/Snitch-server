@@ -2,10 +2,10 @@ import crypto, { scryptSync, timingSafeEqual } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import pg from 'pg';
 import { mergeSeedRecords, seedContributors, seedTariffTable } from './platformRewards.js';
+import { canonicalCollectionDefaults } from './schema.js';
+import { productionTableDefaults } from './productionSchema.js';
 
-const { Pool } = pg;
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.SNITCH_DATA_DIR
     ? path.resolve(process.env.SNITCH_DATA_DIR)
@@ -14,9 +14,6 @@ const DB_FILE = path.join(DATA_DIR, 'platform-db.json');
 const DB_BAK_FILE = path.join(DATA_DIR, 'platform-db.bak.json');
 const DB_TMP_FILE = path.join(DATA_DIR, 'platform-db.tmp.json');
 const ASSET_DIR = path.join(DATA_DIR, 'assets');
-const STORE_DRIVER = String(process.env.SNITCH_STORE_DRIVER || 'file').trim().toLowerCase();
-const USE_SUPABASE_STORE = STORE_DRIVER === 'supabase' || STORE_DRIVER === 'postgres';
-const DATABASE_URL = process.env.DATABASE_URL || process.env.SUPABASE_DATABASE_URL || '';
 const DEFAULT_PASSWORD = process.env.SNITCH_DEMO_PASSWORD || 'snitch-demo-2026';
 const DEFAULT_USERS = [
     {
@@ -74,12 +71,16 @@ const ensureArray = (value) => (Array.isArray(value) ? value : []);
 const normalizePlatformData = (data) => {
     let changed = false;
 
-    if (!data.version || data.version < 4) {
-        data.version = 4;
+    if (!data.version || data.version < 6) {
+        data.version = 6;
         changed = true;
     }
 
     const defaultArrays = {
+        // Canonical schema collections (see schema.js). Empty by default;
+        // populated by the evidence-ingestion pipeline. Legacy collections below
+        // remain during the migration off the prototypeCases blob.
+        ...canonicalCollectionDefaults(),
         orgs: defaultDb().orgs,
         orgUsers: createSeededUsers(),
         mobileUsers: [],
@@ -92,6 +93,7 @@ const normalizePlatformData = (data) => {
         venueCoverage: [],
         analystReviews: [],
         sourceReviews: [],
+        prototypeCases: [],
         casePackets: [],
         assets: [],
         contributors: seedContributors(),
@@ -99,12 +101,27 @@ const normalizePlatformData = (data) => {
         licenseStatus: [],
         tariffTable: seedTariffTable(),
         caseLedger: [],
-        rewardLedger: []
+        rewardLedger: [],
+        venueFingerprints: []
     };
 
     for (const [key, fallback] of Object.entries(defaultArrays)) {
         if (!Array.isArray(data[key])) {
             data[key] = ensureArray(fallback);
+            changed = true;
+        }
+    }
+
+    // Production-shaped capture store (see productionSchema.js). An object of
+    // table->array, distinct from the legacy top-level collections so it maps
+    // 1:1 onto Postgres tables later.
+    if (!data.production || typeof data.production !== 'object' || Array.isArray(data.production)) {
+        data.production = productionTableDefaults();
+        changed = true;
+    }
+    for (const [table, fallback] of Object.entries(productionTableDefaults())) {
+        if (!Array.isArray(data.production[table])) {
+            data.production[table] = fallback;
             changed = true;
         }
     }
@@ -125,7 +142,8 @@ const normalizePlatformData = (data) => {
 };
 
 const defaultDb = () => ({
-    version: 4,
+    version: 6,
+    ...canonicalCollectionDefaults(),
     orgs: [
         {
             id: 'org_platform_admin',
@@ -178,6 +196,7 @@ const defaultDb = () => ({
     venueCoverage: [],
     analystReviews: [],
     sourceReviews: [],
+    prototypeCases: [],
     casePackets: [],
     assets: [],
     contributors: seedContributors(),
@@ -185,14 +204,14 @@ const defaultDb = () => ({
     licenseStatus: [],
     tariffTable: seedTariffTable(),
     caseLedger: [],
-    rewardLedger: []
+    rewardLedger: [],
+    venueFingerprints: [],
+    production: productionTableDefaults()
 });
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 let mutationQueue = Promise.resolve();
-let pgPool = null;
-let supabaseStoreReady = false;
 
 export const MEDIA_DIR = ASSET_DIR;
 
@@ -217,63 +236,6 @@ const ensureStore = async () => {
     } catch {
         await fs.writeFile(DB_FILE, JSON.stringify(defaultDb(), null, 2), 'utf8');
     }
-};
-
-const getPgPool = () => {
-    if (!USE_SUPABASE_STORE) {
-        return null;
-    }
-    if (!DATABASE_URL) {
-        throw new Error('SNITCH_STORE_DRIVER=supabase requires DATABASE_URL or SUPABASE_DATABASE_URL');
-    }
-    if (!pgPool) {
-        pgPool = new Pool({
-            connectionString: DATABASE_URL,
-            ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
-            max: Number(process.env.PG_POOL_MAX || 4),
-            allowExitOnIdle: true,
-            idleTimeoutMillis: 30_000,
-            connectionTimeoutMillis: 10_000,
-        });
-    }
-    return pgPool;
-};
-
-const ensureSupabaseStore = async () => {
-    if (supabaseStoreReady) {
-        return;
-    }
-    const pool = getPgPool();
-    await pool.query(`
-        create extension if not exists pgcrypto;
-
-        create table if not exists public.platform_state (
-            id text primary key default 'default',
-            version integer not null default 4,
-            data jsonb not null default '{}'::jsonb,
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now(),
-            constraint platform_state_singleton check (id = 'default'),
-            constraint platform_state_data_is_object check (jsonb_typeof(data) = 'object')
-        );
-
-        create or replace function public.set_updated_at()
-        returns trigger
-        language plpgsql
-        as $$
-        begin
-            new.updated_at = now();
-            return new;
-        end;
-        $$;
-
-        drop trigger if exists set_platform_state_updated_at on public.platform_state;
-        create trigger set_platform_state_updated_at
-        before update on public.platform_state
-        for each row
-        execute function public.set_updated_at();
-    `);
-    supabaseStoreReady = true;
 };
 
 const writePlatformDataAtomically = async (serializedData, options = {}) => {
@@ -322,24 +284,6 @@ const parsePlatformData = (content) => {
 };
 
 export const readPlatformData = async () => {
-    if (USE_SUPABASE_STORE) {
-        await ensureSupabaseStore();
-        const pool = getPgPool();
-        const result = await pool.query('select data from public.platform_state where id = $1', ['default']);
-
-        if (!result.rowCount) {
-            const fresh = defaultDb();
-            await writeSupabasePlatformData(fresh);
-            return fresh;
-        }
-
-        const data = result.rows[0].data;
-        if (normalizePlatformData(data)) {
-            await writeSupabasePlatformData(data);
-        }
-        return data;
-    }
-
     await ensureStore();
 
     const tryRead = async (filename) => {
@@ -379,28 +323,7 @@ export const readPlatformData = async () => {
     }
 };
 
-const writeSupabasePlatformData = async (data) => {
-    await ensureSupabaseStore();
-    const pool = getPgPool();
-    const version = Number(data?.version || 4);
-    await pool.query(
-        `
-            insert into public.platform_state (id, version, data)
-            values ('default', $1, $2::jsonb)
-            on conflict (id) do update
-            set version = excluded.version,
-                data = excluded.data
-        `,
-        [version, JSON.stringify(data)]
-    );
-};
-
 export const writePlatformData = async (data, options = {}) => {
-    if (USE_SUPABASE_STORE) {
-        await writeSupabasePlatformData(data);
-        return;
-    }
-
     await writePlatformDataAtomically(JSON.stringify(data, null, 2), options);
 };
 

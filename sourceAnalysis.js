@@ -33,7 +33,52 @@ export const normalizeSourceClassifierMode = (value, fallback = SOURCE_CLASSIFIE
 
 export const DEFAULT_SOURCE_CLASSIFIER_MODE = normalizeSourceClassifierMode(
     process.env.SOURCE_CLASSIFIER_MODE,
-    SOURCE_CLASSIFIER_MODES.STABLE
+    SOURCE_CLASSIFIER_MODES.FFT_EXPERIMENTAL
+);
+
+// Operational labels are what analysts and the UI should read. The internal
+// sourceClass tokens are kept stable for scoring/regression, but everything
+// surfaced to a human should go through this map.
+export const SOURCE_OPERATIONAL_LABELS = Object.freeze({
+    venue_pa: 'Venue PA',
+    likely_pa_system: 'Venue PA',
+    small_venue_speaker: 'Small venue speaker',
+    likely_small_speaker: 'Small venue speaker',
+    personal_device: 'Personal device',
+    likely_personal_device: 'Personal device',
+    tv_screen: 'TV / screen playback',
+    live_performer: 'Live performer',
+    no_music: 'No music',
+    speech_ambience: 'Speech / ambience',
+    inconclusive: 'Inconclusive',
+});
+
+// Classes that represent actual venue-scale music playback (the only ones that
+// support a music-use enforcement claim).
+export const VENUE_PLAYBACK_SOURCE_CLASSES = Object.freeze([
+    'likely_pa_system',
+    'venue_pa',
+    'likely_small_speaker',
+    'small_venue_speaker',
+]);
+
+// Classes that mean there is no enforceable venue music playback in the capture.
+export const NON_MUSIC_SOURCE_CLASSES = Object.freeze([
+    'no_music',
+    'speech_ambience',
+    'tv_screen',
+]);
+
+export const toOperationalSourceLabel = (sourceClass) => (
+    SOURCE_OPERATIONAL_LABELS[String(sourceClass || '').toLowerCase()] || 'Inconclusive'
+);
+
+export const sourceClassSupportsVenuePlayback = (sourceClass) => (
+    VENUE_PLAYBACK_SOURCE_CLASSES.includes(String(sourceClass || '').toLowerCase())
+);
+
+export const isNonMusicSourceClass = (sourceClass) => (
+    NON_MUSIC_SOURCE_CLASSES.includes(String(sourceClass || '').toLowerCase())
 );
 
 const THIRD_OCTAVE_CENTERS = [
@@ -582,12 +627,120 @@ const finalizeClassification = ({
     modelVersion,
 }) => ({
     sourceClass,
+    operationalLabel: toOperationalSourceLabel(sourceClass),
+    supportsVenuePlayback: sourceClassSupportsVenuePlayback(sourceClass),
     confidence: Number(confidence.toFixed(2)),
     score: Math.round(score),
     signals: features,
     explanation,
     modelVersion,
 });
+
+const applyWeakSignalGuardrail = (analysis) => {
+    const weakSignal = (
+        Number(analysis?.signals?.overallRms || 0) < 0.01
+        || Number(analysis?.signals?.peakOverallRms ?? analysis?.signals?.overallRms ?? 0) < 0.015
+    );
+
+    if (!weakSignal) {
+        return analysis;
+    }
+
+    const guardedScore = Math.min(Number(analysis.score || 0), 55);
+    const guardedConfidence = Math.min(Number(analysis.confidence || 0), 0.6);
+    const explanation = [
+        ...analysis.explanation,
+        'Overall captured music energy is very low, so the source score is capped and should be treated as inconclusive.',
+    ];
+
+    return {
+        ...analysis,
+        sourceClass: 'inconclusive',
+        operationalLabel: toOperationalSourceLabel('inconclusive'),
+        supportsVenuePlayback: false,
+        score: Math.round(guardedScore),
+        confidence: Number(guardedConfidence.toFixed(2)),
+        explanation,
+        signals: {
+            ...analysis.signals,
+            weakSignalGuardrail: 1,
+        },
+    };
+};
+
+// Runs before any playback class is trusted. Captures with no music, only
+// speech/room ambience, or screen-media audio must not be labelled as venue
+// playback, otherwise office buzz and home-TV recordings score as enforceable
+// playback (see CASE-C80CB8 / CASE-89CAB3). Thresholds here are intentionally
+// conservative; the deeper classifier work tunes them with fixtures.
+const applyNonMusicGuardrail = (analysis, visualCues = null) => {
+    const signals = analysis?.signals || {};
+    const overallRms = Number(signals.overallRms || 0);
+    const silenceRatio = Number(signals.silenceRatio || 0);
+    const ambientContinuity = Number(signals.ambientContinuity ?? signals.windowEnergyContinuity ?? 0);
+    const subToMidRatio = Number(signals.subToMidRatio || 0);
+    const crestFactor = Number(signals.crestFactor || 0);
+
+    let guardClass = null;
+    let reason = null;
+
+    // Visual cue that a TV/screen is the media source overrides audio-only guesses.
+    if (visualCues && (visualCues.tvOrScreen === true || visualCues.screenMedia === true)) {
+        guardClass = 'tv_screen';
+        reason = 'Visual context indicates a TV/screen is the media source rather than venue playback.';
+    } else if (overallRms <= 0.004 || (silenceRatio >= 0.6 && ambientContinuity <= 0.12)) {
+        // Almost no sustained sound energy: there is effectively no music playing.
+        guardClass = 'no_music';
+        reason = 'Captured audio has almost no sustained music energy, so no venue playback is present.';
+    } else if (
+        silenceRatio >= 0.35
+        && ambientContinuity <= 0.2
+        && subToMidRatio <= 0.08
+        && crestFactor >= 5
+    ) {
+        // Energy comes in peaky bursts with gaps and little sustained low-end:
+        // consistent with speech/room conversation, not music playback.
+        guardClass = 'speech_ambience';
+        reason = 'Audio is peaky with large gaps and weak sustained low-end, consistent with speech/room ambience rather than music.';
+    }
+
+    if (!guardClass) {
+        return analysis;
+    }
+
+    return {
+        ...analysis,
+        sourceClass: guardClass,
+        operationalLabel: toOperationalSourceLabel(guardClass),
+        supportsVenuePlayback: false,
+        confidence: Number(Math.min(Number(analysis.confidence || 0.6), 0.7).toFixed(2)),
+        explanation: [...(analysis.explanation || []), reason],
+        signals: {
+            ...signals,
+            nonMusicGuardrail: guardClass,
+        },
+    };
+};
+
+const reconcileSourceExplanation = (analysis) => {
+    const explanation = Array.isArray(analysis?.explanation)
+        ? [...analysis.explanation]
+        : [];
+    const finalLabel = `${Math.round(Number(analysis.score || 0))}/100 (${String(analysis.sourceClass || 'inconclusive').replaceAll('_', ' ')}).`;
+    const finalLinePattern = /(source score:\s*)\d+\/100\s*\([^)]+\)\.?$/i;
+    const finalLineIndex = explanation.findIndex((line) => finalLinePattern.test(String(line || '')));
+
+    if (finalLineIndex === -1) {
+        explanation.push(`Source score: ${finalLabel}`);
+    } else {
+        explanation[finalLineIndex] = String(explanation[finalLineIndex]).replace(finalLinePattern, `$1${finalLabel}`);
+    }
+
+    return {
+        ...analysis,
+        explanation,
+    };
+};
 
 const analyzeAudioSourceV1 = (decoded, window, startSample) => {
     const temporal = measureTemporalFeatures(window, decoded.sampleRate);
@@ -1093,11 +1246,13 @@ export const analyzeAudioSource = (wavBuffer, options = {}) => {
         }
     }
 
-    return {
+    const adjusted = {
         ...analysis,
         score: Math.round(adjustedScore),
         confidence: Number(adjustedConfidence.toFixed(2)),
         sourceClass,
+        operationalLabel: toOperationalSourceLabel(sourceClass),
+        supportsVenuePlayback: sourceClassSupportsVenuePlayback(sourceClass),
         signals: {
             ...analysis.signals,
             reverbScore: reverb.reverbScore,
@@ -1105,4 +1260,13 @@ export const analyzeAudioSource = (wavBuffer, options = {}) => {
         },
         classifierMode: mode,
     };
+
+    // Non-music guardrail runs before the weak-signal cap so that genuinely
+    // music-free captures get a non-music label instead of a muted playback one.
+    const guarded = applyNonMusicGuardrail(adjusted, options.visualCues);
+    const finalAnalysis = isNonMusicSourceClass(guarded.sourceClass)
+        ? guarded
+        : applyWeakSignalGuardrail(guarded);
+
+    return reconcileSourceExplanation(finalAnalysis);
 };
